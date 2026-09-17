@@ -94,3 +94,424 @@
       historyBrowsing: false,
       deleting: false,
       deleteRequestId: '',
+      deleteEntryId: '',
+      deleteTimer: null,
+      deleteCandidate: null,
+      deleteArmedEntryId: '',
+      deleteArmTimer: null,
+      decodeHeartbeat: 0
+    };
+    const $ = id => document.getElementById(id);
+
+    window.addEventListener('load', init);
+    window.addEventListener('message', onParentMessage);
+    window.addEventListener('pagehide', stopCamera);
+    $('closeBtn').addEventListener('click', closeScanner);
+    $('startBtn').addEventListener('click', startCamera);
+
+    function init(){
+      $('eventName').textContent = state.eventName;
+      updateCount(state.count);
+      if(!state.channel || !window.opener){
+        setConnection('Open this scanner from the Student Attendance app.', 'bad');
+        showResult('NOT CONNECTED','Open from attendance app','','No attendance will be recorded.','bad');
+        showStart('Return to the attendance app and tap Open Live Camera Scanner.');
+        return;
+      }
+      send({type:'STUDENT_SCANNER_READY'});
+      startCamera();
+    }
+
+    function send(payload){
+      if(!window.opener) return false;
+      try{window.opener.postMessage(Object.assign({channel:state.channel},payload||{}),'*');return true}catch(e){return false}
+    }
+
+    function onParentMessage(event){
+      if(event.source !== window.opener) return;
+      const data=event.data;
+      if(!data || typeof data!=='object' || data.channel!==state.channel) return;
+
+      if(data.type==='ATTENDANCE_PARENT_READY'){
+        state.connected=true;
+        state.eventName=String(data.eventName||state.eventName);
+        state.count=Number(data.count||0);
+        $('eventName').textContent=state.eventName;
+        updateCount(state.count);
+        setConnection('CONNECTED — camera ready for the next student','good');
+        $('topSub').textContent='Live camera • Code 39 Extended / Code 39 / Code 128';
+        return;
+      }
+
+      if(data.type==='ATTENDANCE_HISTORY'){
+        setHistory(Array.isArray(data.entries)?data.entries:[]);
+        return;
+      }
+
+      if(data.type==='ATTENDANCE_SYNC'){
+        state.count=Number(data.count||0);
+        updateCount(state.count);
+        if(Array.isArray(data.entries)) setHistory(data.entries);
+        return;
+      }
+
+      if(data.type==='ATTENDANCE_PARENT_LEFT'){
+        state.connected=false;state.awaiting=false;
+        stopCamera();
+        setConnection('Scanner disconnected from the attendance event.','bad');
+        showResult('SCANNER CLOSED','Return to attendance app','','Join an event and reopen the live camera scanner.','bad');
+        return;
+      }
+
+      if(data.type==='STUDENT_PHOTO_RESULT'){
+        const rid=String(data.requestId||'');
+        const sid=String(data.studentId||'');
+        if(rid===state.displayedPhotoRequestId && sid===state.displayedStudentId){
+          if(data.ok && data.dataUrl) setPhoto(String(data.dataUrl));
+          else resetPhoto();
+        }
+        return;
+      }
+
+      if(data.type==='ATTENDANCE_DELETE_RESULT'){
+        const rid=String(data.requestId||'');
+        if(!rid || rid!==state.deleteRequestId) return;
+        clearTimeout(state.deleteTimer);state.deleteTimer=null;
+        state.deleting=false;
+        const eid=String(data.entryId||state.deleteEntryId||'');
+        const sid=String(data.studentId||'');
+        const removed=(state.history||[]).find(e=>String(e.entryId||'')===eid);
+        state.deleteRequestId='';state.deleteEntryId='';
+        state.count=Number(data.count||state.count||0);updateCount(state.count);
+        if(data.ok){
+          state.history=(state.history||[]).filter(e=>String(e.entryId||'')!==eid);
+          // A deleted student must be immediately scannable again. The old build
+          // kept the 7-second anti-double-scan lock, which made a successful delete
+          // look like the camera had frozen when testing the same barcode again.
+          state.lastCode='';
+          state.lastCodeAt=0;
+          renderHistory();
+          // Do not interrupt a newer scan that happened while the delete was saving.
+          if(!state.awaiting && String(state.displayedStudentId||'')===String(sid||(removed&&removed.studentId)||'')){
+            resetPhoto();
+            showResult('REMOVED',displayName(String(data.studentName||(removed&&removed.studentName)||'Attendance entry')),sid||(removed&&removed.studentId)||'', 'Deleted from this event attendance.','bad');
+          }
+          setConnection('CONNECTED — entry removed; scanner is ready','good');
+          warningFeedback();
+        }else{
+          if(!state.awaiting) showResult('DELETE FAILED','Entry was not removed',sid,String(data.message||'Try again.'),'bad');
+          renderHistory();
+          setConnection('CONNECTED — delete failed; scanner is still ready','good');
+          errorFeedback();
+        }
+        return;
+      }
+
+      if(data.type==='ATTENDANCE_SESSION_CLOSED'){
+        state.connected=false;state.awaiting=false;
+        stopCamera();
+        setConnection('This attendance event was closed.','bad');
+        showResult('EVENT CLOSED','Return to attendance app','','Join another active event or start a new one before scanning.','bad');
+        return;
+      }
+
+      if(data.type!=='STUDENT_ATTENDANCE_RESULT') return;
+      if(String(data.requestId||'')!==state.pendingRequestId) return;
+      clearTimeout(state.pendingTimer);state.pendingTimer=null;
+      state.awaiting=false;
+      state.historyBrowsing=false;
+      const status=String(data.status||'ERROR');
+      const sid=String(data.studentId||state.pendingId||'');
+      const rawName=String(data.studentName||'');
+      const name=displayName(rawName);
+      const requestId=String(data.requestId||'');
+      state.count=Number(data.count||state.count||0);updateCount(state.count);
+      state.displayedPhotoRequestId=requestId;
+      resetPhoto();
+
+      if(status==='RECORDED'){
+        showResult('✓ RECORDED',name||'Student recorded',sid,(data.time?'Saved '+data.time:'Spreadsheet save confirmed.'),'good');
+        addHistoryEntry({entryId:String(data.entryId||''),studentId:sid,studentName:rawName||name,time:String(data.time||'')},true);
+        successFeedback();
+      }else if(status==='DUPLICATE'){
+        showResult('ALREADY RECORDED',name||'Student',sid,(data.time?'Previous check-in '+data.time:'No second entry was added.'),'warn');
+        selectHistoryByStudent(sid,false);
+        warningFeedback();
+      }else if(status==='BUSY'){
+        showResult('TRY AGAIN','Previous student still saving',sid,data.message||'Scan again in a moment.','warn');
+        warningFeedback();
+      }else{
+        showResult('NOT RECORDED',name||'Check failed',sid,data.message||'Attendance was not saved.','bad');
+        errorFeedback();
+      }
+
+      // Keep the most recently viewed/scanned student on screen. The live camera
+      // continues scanning; the next successful scan automatically becomes current.
+      state.pendingRequestId='';state.pendingId='';
+    }
+
+    async function startCamera(){
+      hideStart();
+      if(!window.isSecureContext){showStart('This page must be hosted with HTTPS before a phone can use the camera.');return}
+      if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){showStart('This browser does not provide live camera access. Try Safari on iPhone or Chrome on Android.');return}
+      if(!(window.ZXingBrowser && ZXingBrowser.BrowserMultiFormatReader)){showStart('The barcode library did not load. Check the internet connection and try again.');return}
+      stopCamera();
+      try{
+        // Focus on the formats used for student IDs. ZXing's DecodeHintType values:
+        // POSSIBLE_FORMATS = 2, TRY_HARDER = 3,
+        // ENABLE_CODE_39_EXTENDED_MODE = 7.
+        // BarcodeFormat.CODE_39 = 2; BarcodeFormat.CODE_128 = 4.
+        const decodeHints=new Map();
+        decodeHints.set(2,[2,4]);
+        decodeHints.set(3,true); // spend more time finding narrow/onscreen 1D bars
+        decodeHints.set(7,true); // Code 39 Extended / Full ASCII
+        state.reader=new ZXingBrowser.BrowserMultiFormatReader(decodeHints,{delayBetweenScanAttempts:55,delayBetweenScanSuccess:350});
+        state.controls=await state.reader.decodeFromConstraints({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}},$('video'),(result,error,controls)=>{
+          state.decodeHeartbeat=Date.now();
+          if(result) handleBarcode(typeof result.getText==='function'?result.getText():(result.text||''));
+        });
+        state.running=true;
+        // Ask phones for continuous autofocus when the browser exposes it. This is
+        // particularly helpful for thin Code 39 bars displayed on a Chromebook/iPad.
+        try{
+          const stream=$('video').srcObject;
+          const track=stream&&stream.getVideoTracks&&stream.getVideoTracks()[0];
+          const caps=track&&track.getCapabilities?track.getCapabilities():null;
+          if(track&&caps&&Array.isArray(caps.focusMode)&&caps.focusMode.includes('continuous')){
+            track.applyConstraints({advanced:[{focusMode:'continuous'}]}).catch(()=>{});
+          }
+        }catch(e){}
+        setConnection(state.connected?'CONNECTED — camera ready for the next student':'CAMERA READY — connecting to attendance app…','good');
+      }catch(err){
+        const name=String(err&&err.name||'');
+        let msg='Live camera could not start.';
+        if(/NotAllowed|Security/i.test(name)) msg='Camera permission was denied. Allow Camera for this website in the browser settings, then tap Start Camera.';
+        else if(/NotFound|DevicesNotFound/i.test(name)) msg='No rear camera was found on this device.';
+        else if(/NotReadable|TrackStart/i.test(name)) msg='The camera is being used by another app. Close it there and try again.';
+        showStart(msg);
+        setConnection(msg,'bad');
+      }
+    }
+
+    function handleBarcode(raw){
+      // A delete can save in the background; only pause barcode handling while the
+      // on-page confirmation sheet itself is visible.
+      if(!state.connected || state.awaiting) return;
+      const text=String(raw||'').trim();
+      // Code 39 start/stop asterisks are stripped by the decoder. For numeric
+      // student IDs, Standard and Extended Code 39 decode to the same digits.
+      const match=text.match(/\d{4,10}/);
+      if(!match) return;
+      const id=match[0], now=Date.now();
+      if(id===state.lastCode && now-state.lastCodeAt<2200) return;
+      state.lastCode=id;state.lastCodeAt=now;
+      state.awaiting=true;state.pendingId=id;state.pendingRequestId=randomId();
+      state.historyBrowsing=false;
+      state.displayedPhotoRequestId=state.pendingRequestId;
+      resetPhoto();
+      showResult('SAVING…','Student ID '+id,id,'Waiting for spreadsheet confirmation.','saving');
+      send({type:'STUDENT_BARCODE_SCAN',studentId:id,barcode:text,requestId:state.pendingRequestId});
+      clearTimeout(state.pendingTimer);
+      state.pendingTimer=setTimeout(()=>{
+        if(!state.awaiting) return;
+        state.awaiting=false;
+        showResult('NO CONFIRMATION','Student ID '+id,id,'The attendance app did not confirm the save. Check the original attendance tab before rescanning.','bad');
+        errorFeedback();
+        state.pendingRequestId='';state.pendingId='';
+      },12000);
+    }
+
+    function setHistory(entries){
+      const cleaned=[];
+      const seen=new Set();
+      (entries||[]).forEach(e=>{
+        const sid=String(e&&e.studentId||'').trim();
+        if(!sid || seen.has(sid+'|'+String(e&&e.entryId||''))) return;
+        seen.add(sid+'|'+String(e&&e.entryId||''));
+        cleaned.push({
+          entryId:String(e&&e.entryId||''),
+          studentId:sid,
+          studentName:String(e&&e.studentName||''),
+          time:String(e&&e.time||'')
+        });
+      });
+      state.history=cleaned.slice(0,50);
+      renderHistory();
+    }
+
+    function addHistoryEntry(entry,bringToFront){
+      const sid=String(entry&&entry.studentId||'').trim();
+      if(!sid) return;
+      const eid=String(entry&&entry.entryId||'');
+      state.history=(state.history||[]).filter(e=>eid ? String(e.entryId||'')!==eid : String(e.studentId||'')!==sid);
+      state.history.unshift({entryId:eid,studentId:sid,studentName:String(entry.studentName||''),time:String(entry.time||'')});
+      state.history=state.history.slice(0,50);
+      renderHistory();
+      if(bringToFront) scrollHistoryToNewest();
+    }
+
+    function renderHistory(){
+      const host=$('historyStrip');
+      host.innerHTML='';
+      if(!state.history.length){host.innerHTML='<div class="history-empty">No students checked in yet.</div>';return}
+      state.history.forEach((entry,index)=>{
+        const selected=String(entry.studentId||'')===state.displayedStudentId;
+        const card=document.createElement('div');
+        card.className='history-card'+(selected?' selected':'');
+        card.dataset.index=String(index);
+        card.setAttribute('role','button');card.tabIndex=0;
+        const nm=document.createElement('div');nm.className='hn';nm.textContent=displayName(entry.studentName||'Student');
+        const meta=document.createElement('div');meta.className='hm';
+        const id=document.createElement('span');id.textContent='ID '+entry.studentId;
+        const tm=document.createElement('span');tm.textContent=entry.time||'';
+        meta.append(id,tm);card.append(nm,meta);
+        card.addEventListener('click',()=>selectHistoryEntry(entry));
+        card.addEventListener('keydown',ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();selectHistoryEntry(entry)}});
+        if(selected && entry.entryId){
+          const del=document.createElement('button');
+          del.type='button';del.className='history-delete';del.setAttribute('aria-label','Delete '+displayName(entry.studentName||'student'));
+          const armed=String(state.deleteArmedEntryId||'')===String(entry.entryId||'');
+          if(armed){del.classList.add('armed');del.textContent='DELETE';}
+          else del.textContent='×';
+          del.addEventListener('click',ev=>{ev.stopPropagation();requestHistoryDelete(entry,del)});
+          card.appendChild(del);
+        }
+        host.appendChild(card);
+      });
+    }
+
+    function requestHistoryDelete(entry,button){
+      if(state.deleting || state.awaiting) return;
+      const eid=String(entry&&entry.entryId||'');
+      if(!eid){
+        setConnection('This history entry cannot be deleted because its attendance ID is unavailable.','bad');
+        return;
+      }
+
+      // Do not open any modal or stop/restart the camera. On iPhone, compositing a
+      // full-screen overlay above a live video element can leave the camera preview
+      // or decoder stalled even though the spreadsheet deletion succeeds.
+      // First tap arms the red button; a second tap within 4 seconds deletes it.
+      if(String(state.deleteArmedEntryId||'')!==eid){
+        state.deleteArmedEntryId=eid;
+        clearTimeout(state.deleteArmTimer);
+        state.deleteArmTimer=setTimeout(()=>{
+          if(state.deleteArmedEntryId===eid){state.deleteArmedEntryId='';renderHistory();}
+        },4000);
+        renderHistory();
+        setConnection('Tap DELETE again to remove '+displayName(entry.studentName||'this student')+'. Camera remains live.','');
+        return;
+      }
+
+      clearTimeout(state.deleteArmTimer);state.deleteArmTimer=null;state.deleteArmedEntryId='';
+      performHistoryDelete(entry);
+    }
+
+    function performHistoryDelete(entry){
+      if(state.deleting) return;
+      state.deleting=true;
+      state.deleteRequestId=randomId();
+      state.deleteEntryId=String(entry.entryId||'');
+
+      // Deletion is deliberately just a message to the attendance window. Nothing
+      // in this path calls stopCamera(), startCamera(), video.pause(), or changes the
+      // MediaStream. Scanning remains independent of the spreadsheet operation.
+      setConnection('DELETING '+displayName(entry.studentName||'student')+' — camera remains active','');
+      send({type:'STUDENT_DELETE_REQUEST',requestId:state.deleteRequestId,entryId:state.deleteEntryId,studentId:String(entry.studentId||'')});
+      clearTimeout(state.deleteTimer);
+      state.deleteTimer=setTimeout(()=>{
+        if(!state.deleting) return;
+        state.deleting=false;state.deleteRequestId='';state.deleteEntryId='';
+        setConnection('CONNECTED — delete was not confirmed; scanner is still active','good');
+        renderHistory();
+        errorFeedback();
+      },8000);
+    }
+
+    function cameraStreamIsLive(){
+      try{
+        const v=$('video'), stream=v&&v.srcObject;
+        return !!(stream&&stream.getVideoTracks&&stream.getVideoTracks().some(t=>t.readyState==='live'));
+      }catch(e){return false}
+    }
+
+    // This check is intentionally independent of deletion. It only attempts a
+    // restart when the actual MediaStream has ended. A missing ZXing callback is
+    // not treated as a dead camera, because that caused unnecessary restarts on
+    // phones while the camera was perfectly healthy.
+    setInterval(()=>{
+      if(!state.connected || !state.running) return;
+      const v=$('video');
+      if(cameraStreamIsLive()){
+        try{if(v&&v.paused)v.play().catch(()=>{});}catch(e){}
+        return;
+      }
+      restartCameraQuietly();
+    },2500);
+
+    async function restartCameraQuietly(){
+      if(!state.connected) return;
+      setConnection('RESTARTING CAMERA — one moment…','');
+      try{
+        await startCamera();
+        if(state.connected) setConnection('CONNECTED — camera ready for the next student','good');
+      }catch(e){
+        showStart('The camera stopped. Tap Start Camera to resume scanning.');
+      }
+    }
+
+    function selectHistoryEntry(entry){
+      state.historyBrowsing=true;
+      const sid=String(entry&&entry.studentId||'');
+      const rid='photo-'+randomId();
+      state.displayedPhotoRequestId=rid;
+      resetPhoto();
+      showResult('CHECKED IN',displayName(entry.studentName||'Student'),sid,(entry.time?'Checked in '+entry.time:'Previously checked in.'),'good');
+      renderHistory();
+      if(sid) send({type:'STUDENT_PHOTO_REQUEST',studentId:sid,requestId:rid});
+    }
+
+    function selectHistoryByStudent(studentId,scroll){
+      const sid=String(studentId||'');
+      const entry=(state.history||[]).find(e=>String(e.studentId||'')===sid);
+      if(entry){
+        renderHistory();
+        if(scroll){
+          const host=$('historyStrip');
+          const index=state.history.indexOf(entry);
+          const card=host.children[index];
+          if(card&&card.scrollIntoView)card.scrollIntoView({behavior:'smooth',inline:'start',block:'nearest'});
+        }
+      }
+    }
+
+    function scrollHistoryToNewest(){
+      const host=$('historyStrip');
+      try{host.scrollTo({left:0,behavior:'smooth'})}catch(e){host.scrollLeft=0}
+    }
+
+    function showResult(label,name,id,detail,type){
+      state.displayedStudentId=String(id||'');
+      const el=$('result');el.className='result'+(type?' '+type:'');el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');
+      $('resultLabel').textContent=label;$('studentName').textContent=name;$('studentId').textContent=id?('Student ID '+id):'';$('detail').textContent=detail||'';
+      renderHistory();
+    }
+    function setPhoto(url){resetPhoto();if(!url)return;const img=$('photo');img.onload=()=>{img.style.display='block';$('photoText').style.display='none'};img.onerror=resetPhoto;img.src=url}
+    function resetPhoto(){const img=$('photo');img.removeAttribute('src');img.style.display='none';$('photoText').style.display='block'}
+    function updateCount(n){$('count').textContent=Number(n||0)+' recorded'}
+    function setConnection(text,type){const el=$('connection');el.textContent=text;el.style.background=type==='good'?'#123e2a':type==='bad'?'#5f201b':'#14273b'}
+    function showStart(message){$('startMessage').textContent=message||'Tap below to allow access to the rear camera.';$('startLayer').classList.remove('hidden')}
+    function hideStart(){$('startLayer').classList.add('hidden')}
+    function stopCamera(){try{if(state.controls&&state.controls.stop)state.controls.stop()}catch(e){};state.controls=null;state.running=false;const v=$('video');try{const s=v.srcObject;if(s&&s.getTracks)s.getTracks().forEach(t=>t.stop())}catch(e){};if(v)v.srcObject=null}
+    function closeScanner(){stopCamera();try{window.close()}catch(e){};setTimeout(()=>{$('topSub').textContent='You can close this browser tab.'},150)}
+    function randomId(){try{if(crypto.randomUUID)return crypto.randomUUID()}catch(e){}return Date.now()+'-'+Math.random().toString(36).slice(2)}
+    function displayName(name){const text=String(name||'').trim();if(!text.includes(','))return titleCase(text);const p=text.split(',');return titleCase((p.slice(1).join(',')+' '+p[0]).trim())}
+    function titleCase(s){return String(s||'').toLowerCase().replace(/\b([a-z])/g,m=>m.toUpperCase())}
+    function tone(freq,duration){try{const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;const c=new AC(),o=c.createOscillator(),g=c.createGain();o.frequency.value=freq;g.gain.value=.055;o.connect(g);g.connect(c.destination);o.start();setTimeout(()=>{o.stop();c.close()},duration)}catch(e){}}
+    function vibrate(pattern){try{if(navigator.vibrate)navigator.vibrate(pattern)}catch(e){}}
+    function successFeedback(){tone(900,95);vibrate(80)}
+    function warningFeedback(){tone(510,140);vibrate([80,45,80])}
+    function errorFeedback(){tone(230,190);vibrate(190)}
+  </script>
+</body>
+</html>
