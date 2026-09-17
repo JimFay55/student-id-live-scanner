@@ -141,6 +141,21 @@
         return;
       }
 
+      if(data.type==='ATTENDANCE_SYNC'){
+        state.count=Number(data.count||0);
+        updateCount(state.count);
+        if(Array.isArray(data.entries)) setHistory(data.entries);
+        return;
+      }
+
+      if(data.type==='ATTENDANCE_PARENT_LEFT'){
+        state.connected=false;state.awaiting=false;
+        stopCamera();
+        setConnection('Scanner disconnected from the attendance event.','bad');
+        showResult('SCANNER CLOSED','Return to attendance app','','Join an event and reopen the live camera scanner.','bad');
+        return;
+      }
+
       if(data.type==='STUDENT_PHOTO_RESULT'){
         const rid=String(data.requestId||'');
         const sid=String(data.studentId||'');
@@ -166,10 +181,12 @@
           resetPhoto();
           showResult('REMOVED',displayName(String(data.studentName||(removed&&removed.studentName)||'Attendance entry')),sid||(removed&&removed.studentId)||'', 'Deleted from this event attendance.','bad');
           renderHistory();
+          setConnection('CONNECTED — ready for the next student','good');
           warningFeedback();
         }else{
           showResult('DELETE FAILED','Entry was not removed',sid,String(data.message||'Try again.'),'bad');
           renderHistory();
+          setConnection('CONNECTED — ready for the next student','good');
           errorFeedback();
         }
         return;
@@ -177,8 +194,9 @@
 
       if(data.type==='ATTENDANCE_SESSION_CLOSED'){
         state.connected=false;state.awaiting=false;
+        stopCamera();
         setConnection('This attendance event was closed.','bad');
-        showResult('EVENT CLOSED','Return to attendance app','','Start or reopen an event before scanning.','bad');
+        showResult('EVENT CLOSED','Return to attendance app','','Join another active event or start a new one before scanning.','bad');
         return;
       }
 
@@ -338,10 +356,10 @@
       state.deleteTimer=setTimeout(()=>{
         if(!state.deleting) return;
         state.deleting=false;state.deleteRequestId='';state.deleteEntryId='';
-        setConnection('Delete was not confirmed. The entry may still be present.','bad');
+        setConnection('CONNECTED — delete was not confirmed; scanning is still available','good');
         renderHistory();
         errorFeedback();
-      },12000);
+      },8000);
     }
 
     function selectHistoryEntry(entry){
