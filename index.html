@@ -30,8 +30,9 @@
     .history-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 2px 6px}.history-title{font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:.65px;color:#dce8f3}.history-help{font-size:10px;color:#91a7ba}
     .history-strip{display:flex;gap:7px;overflow-x:auto;overscroll-behavior-x:contain;scroll-snap-type:x proximity;padding-bottom:4px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
     .history-strip::-webkit-scrollbar{display:none}
-    .history-card{flex:0 0 158px;scroll-snap-align:start;background:#173149;color:#f4f8fb;border:1px solid rgba(255,255,255,.11);border-radius:10px;padding:7px 9px;text-align:left;min-height:60px}
-    .history-card.selected{outline:2px solid var(--blue);background:#214664}.history-card .hn{font-size:12px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.history-card .hm{font-size:10px;color:#bed0df;margin-top:4px;display:flex;justify-content:space-between;gap:5px}.history-empty{font-size:11px;color:#91a7ba;padding:13px 5px}
+    .history-card{position:relative;flex:0 0 158px;scroll-snap-align:start;background:#173149;color:#f4f8fb;border:1px solid rgba(255,255,255,.11);border-radius:10px;padding:7px 9px;text-align:left;min-height:60px;cursor:pointer;user-select:none}
+    .history-card.selected{outline:2px solid var(--blue);background:#214664;padding-right:37px}.history-card .hn{font-size:12px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.history-card .hm{font-size:10px;color:#bed0df;margin-top:4px;display:flex;justify-content:space-between;gap:5px}.history-empty{font-size:11px;color:#91a7ba;padding:13px 5px}
+    .history-delete{position:absolute;right:5px;top:5px;width:27px;height:27px;padding:0;border-radius:50%;background:#c62828;color:#fff;font-size:18px;line-height:27px;text-align:center;box-shadow:0 1px 5px rgba(0,0,0,.35);z-index:2}.history-delete:disabled{opacity:.55}.history-delete:active{transform:scale(.94)}
     .start{position:absolute;inset:0;z-index:10;background:rgba(7,21,36,.91);display:flex;align-items:center;justify-content:center;padding:24px}
     .start.hidden{display:none}.start-card{max-width:420px;width:100%;background:#fff;color:#17212b;border-radius:16px;padding:22px;text-align:center}.start-card h1{font-size:23px;color:var(--navy);margin:0 0 8px}.start-card p{font-size:14px;color:#607080;line-height:1.4}.start-btn{width:100%;font-size:17px;background:var(--navy);color:#fff;margin-top:8px}
     .flash{animation:flash .22s ease}@keyframes flash{0%{transform:scale(.985)}100%{transform:scale(1)}}
@@ -62,7 +63,7 @@
     </div>
 
     <div class="history">
-      <div class="history-head"><div class="history-title">Checked In</div><div class="history-help">Swipe to review • tap an entry</div></div>
+      <div class="history-head"><div class="history-title">Checked In</div><div class="history-help">Swipe • tap an entry • red × deletes</div></div>
       <div id="historyStrip" class="history-strip"><div class="history-empty">No students checked in yet.</div></div>
     </div>
   </div>
@@ -87,7 +88,11 @@
       history: [],
       displayedStudentId: '',
       displayedPhotoRequestId: '',
-      historyBrowsing: false
+      historyBrowsing: false,
+      deleting: false,
+      deleteRequestId: '',
+      deleteEntryId: '',
+      deleteTimer: null
     };
     const $ = id => document.getElementById(id);
 
@@ -142,6 +147,30 @@
         if(rid===state.displayedPhotoRequestId && sid===state.displayedStudentId){
           if(data.ok && data.dataUrl) setPhoto(String(data.dataUrl));
           else resetPhoto();
+        }
+        return;
+      }
+
+      if(data.type==='ATTENDANCE_DELETE_RESULT'){
+        const rid=String(data.requestId||'');
+        if(!rid || rid!==state.deleteRequestId) return;
+        clearTimeout(state.deleteTimer);state.deleteTimer=null;
+        state.deleting=false;
+        const eid=String(data.entryId||state.deleteEntryId||'');
+        const sid=String(data.studentId||'');
+        state.deleteRequestId='';state.deleteEntryId='';
+        state.count=Number(data.count||state.count||0);updateCount(state.count);
+        if(data.ok){
+          const removed=(state.history||[]).find(e=>String(e.entryId||'')===eid);
+          state.history=(state.history||[]).filter(e=>String(e.entryId||'')!==eid);
+          resetPhoto();
+          showResult('REMOVED',displayName(String(data.studentName||(removed&&removed.studentName)||'Attendance entry')),sid||(removed&&removed.studentId)||'', 'Deleted from this event attendance.','bad');
+          renderHistory();
+          warningFeedback();
+        }else{
+          showResult('DELETE FAILED','Entry was not removed',sid,String(data.message||'Try again.'),'bad');
+          renderHistory();
+          errorFeedback();
         }
         return;
       }
@@ -213,7 +242,7 @@
     }
 
     function handleBarcode(raw){
-      if(!state.connected || state.awaiting) return;
+      if(!state.connected || state.awaiting || state.deleting) return;
       const text=String(raw||'').trim();
       const match=text.match(/\d{4,10}/);
       if(!match) return;
@@ -270,18 +299,49 @@
       host.innerHTML='';
       if(!state.history.length){host.innerHTML='<div class="history-empty">No students checked in yet.</div>';return}
       state.history.forEach((entry,index)=>{
-        const card=document.createElement('button');
-        card.type='button';
-        card.className='history-card'+(entry.studentId===state.displayedStudentId?' selected':'');
+        const selected=String(entry.studentId||'')===state.displayedStudentId;
+        const card=document.createElement('div');
+        card.className='history-card'+(selected?' selected':'');
         card.dataset.index=String(index);
+        card.setAttribute('role','button');card.tabIndex=0;
         const nm=document.createElement('div');nm.className='hn';nm.textContent=displayName(entry.studentName||'Student');
         const meta=document.createElement('div');meta.className='hm';
         const id=document.createElement('span');id.textContent='ID '+entry.studentId;
         const tm=document.createElement('span');tm.textContent=entry.time||'';
         meta.append(id,tm);card.append(nm,meta);
         card.addEventListener('click',()=>selectHistoryEntry(entry));
+        card.addEventListener('keydown',ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();selectHistoryEntry(entry)}});
+        if(selected && entry.entryId){
+          const del=document.createElement('button');
+          del.type='button';del.className='history-delete';del.setAttribute('aria-label','Delete '+displayName(entry.studentName||'student'));
+          del.textContent='×';
+          del.addEventListener('click',ev=>{ev.stopPropagation();requestHistoryDelete(entry,del)});
+          card.appendChild(del);
+        }
         host.appendChild(card);
       });
+    }
+
+    function requestHistoryDelete(entry,button){
+      if(state.deleting || state.awaiting) return;
+      const eid=String(entry&&entry.entryId||'');
+      if(!eid){alert('This entry cannot be deleted from the camera history because its attendance entry ID is unavailable.');return}
+      const name=displayName(String(entry.studentName||'this student'));
+      if(!confirm('Delete '+name+' from this event attendance?')) return;
+      state.deleting=true;
+      state.deleteRequestId=randomId();
+      state.deleteEntryId=eid;
+      if(button){button.disabled=true;button.textContent='…'}
+      setConnection('DELETING — waiting for spreadsheet confirmation…','');
+      send({type:'STUDENT_DELETE_REQUEST',requestId:state.deleteRequestId,entryId:eid,studentId:String(entry.studentId||'')});
+      clearTimeout(state.deleteTimer);
+      state.deleteTimer=setTimeout(()=>{
+        if(!state.deleting) return;
+        state.deleting=false;state.deleteRequestId='';state.deleteEntryId='';
+        setConnection('Delete was not confirmed. The entry may still be present.','bad');
+        renderHistory();
+        errorFeedback();
+      },12000);
     }
 
     function selectHistoryEntry(entry){
