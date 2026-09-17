@@ -33,6 +33,9 @@
     .history-card{position:relative;flex:0 0 158px;scroll-snap-align:start;background:#173149;color:#f4f8fb;border:1px solid rgba(255,255,255,.11);border-radius:10px;padding:7px 9px;text-align:left;min-height:60px;cursor:pointer;user-select:none}
     .history-card.selected{outline:2px solid var(--blue);background:#214664;padding-right:37px}.history-card .hn{font-size:12px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.history-card .hm{font-size:10px;color:#bed0df;margin-top:4px;display:flex;justify-content:space-between;gap:5px}.history-empty{font-size:11px;color:#91a7ba;padding:13px 5px}
     .history-delete{position:absolute;right:5px;top:5px;width:27px;height:27px;padding:0;border-radius:50%;background:#c62828;color:#fff;font-size:18px;line-height:27px;text-align:center;box-shadow:0 1px 5px rgba(0,0,0,.35);z-index:2}.history-delete:disabled{opacity:.55}.history-delete:active{transform:scale(.94)}
+    .delete-modal{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.68);display:flex;align-items:flex-end;justify-content:center;padding:16px max(12px,env(safe-area-inset-right)) max(16px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left))}
+    .delete-modal.hidden{display:none}.delete-card{width:min(480px,100%);background:#fff;color:#17212b;border-radius:18px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.45)}
+    .delete-card h2{margin:0 0 7px;color:#8f201a;font-size:20px}.delete-card p{margin:0 0 15px;color:#5f6d79;font-size:14px;line-height:1.4}.delete-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px}.delete-cancel{background:#e9eef3;color:#17324d;font-size:16px}.delete-confirm{background:#b3261e;color:#fff;font-size:16px}
     .start{position:absolute;inset:0;z-index:10;background:rgba(7,21,36,.91);display:flex;align-items:center;justify-content:center;padding:24px}
     .start.hidden{display:none}.start-card{max-width:420px;width:100%;background:#fff;color:#17212b;border-radius:16px;padding:22px;text-align:center}.start-card h1{font-size:23px;color:var(--navy);margin:0 0 8px}.start-card p{font-size:14px;color:#607080;line-height:1.4}.start-btn{width:100%;font-size:17px;background:var(--navy);color:#fff;margin-top:8px}
     .flash{animation:flash .22s ease}@keyframes flash{0%{transform:scale(.985)}100%{transform:scale(1)}}
@@ -68,6 +71,17 @@
     </div>
   </div>
 
+  <div id="deleteModal" class="delete-modal hidden" role="dialog" aria-modal="true" aria-labelledby="deleteTitle">
+    <div class="delete-card">
+      <h2 id="deleteTitle">Delete check-in?</h2>
+      <p id="deleteMessage">This removes the selected student from this event attendance.</p>
+      <div class="delete-actions">
+        <button id="deleteCancel" class="delete-cancel" type="button">Cancel</button>
+        <button id="deleteConfirm" class="delete-confirm" type="button">Delete</button>
+      </div>
+    </div>
+  </div>
+
   <script src="https://unpkg.com/@zxing/browser@0.2.1"></script>
   <script>
     const qs = new URLSearchParams(location.hash.slice(1));
@@ -92,7 +106,11 @@
       deleting: false,
       deleteRequestId: '',
       deleteEntryId: '',
-      deleteTimer: null
+      deleteTimer: null,
+      deleteCandidate: null,
+      deleteModalOpen: false,
+      decodeHeartbeat: 0,
+      heartbeatBeforeDelete: 0
     };
     const $ = id => document.getElementById(id);
 
@@ -101,6 +119,8 @@
     window.addEventListener('pagehide', stopCamera);
     $('closeBtn').addEventListener('click', closeScanner);
     $('startBtn').addEventListener('click', startCamera);
+    $('deleteCancel').addEventListener('click', closeDeleteModal);
+    $('deleteConfirm').addEventListener('click', confirmHistoryDelete);
 
     function init(){
       $('eventName').textContent = state.eventName;
@@ -132,7 +152,7 @@
         $('eventName').textContent=state.eventName;
         updateCount(state.count);
         setConnection('CONNECTED — camera ready for the next student','good');
-        $('topSub').textContent='Live camera • automatic check-in';
+        $('topSub').textContent='Live camera • Code 39 Extended / Code 128';
         return;
       }
 
@@ -173,22 +193,26 @@
         state.deleting=false;
         const eid=String(data.entryId||state.deleteEntryId||'');
         const sid=String(data.studentId||'');
+        const removed=(state.history||[]).find(e=>String(e.entryId||'')===eid);
         state.deleteRequestId='';state.deleteEntryId='';
         state.count=Number(data.count||state.count||0);updateCount(state.count);
         if(data.ok){
-          const removed=(state.history||[]).find(e=>String(e.entryId||'')===eid);
           state.history=(state.history||[]).filter(e=>String(e.entryId||'')!==eid);
-          resetPhoto();
-          showResult('REMOVED',displayName(String(data.studentName||(removed&&removed.studentName)||'Attendance entry')),sid||(removed&&removed.studentId)||'', 'Deleted from this event attendance.','bad');
           renderHistory();
-          setConnection('CONNECTED — ready for the next student','good');
+          // Do not interrupt a newer scan that happened while the delete was saving.
+          if(!state.awaiting && String(state.displayedStudentId||'')===String(sid||(removed&&removed.studentId)||'')){
+            resetPhoto();
+            showResult('REMOVED',displayName(String(data.studentName||(removed&&removed.studentName)||'Attendance entry')),sid||(removed&&removed.studentId)||'', 'Deleted from this event attendance.','bad');
+          }
+          setConnection('CONNECTED — entry removed; scanner is ready','good');
           warningFeedback();
         }else{
-          showResult('DELETE FAILED','Entry was not removed',sid,String(data.message||'Try again.'),'bad');
+          if(!state.awaiting) showResult('DELETE FAILED','Entry was not removed',sid,String(data.message||'Try again.'),'bad');
           renderHistory();
-          setConnection('CONNECTED — ready for the next student','good');
+          setConnection('CONNECTED — delete failed; scanner is still ready','good');
           errorFeedback();
         }
+        ensureDecoderResponsive(state.heartbeatBeforeDelete);
         return;
       }
 
@@ -242,8 +266,18 @@
       if(!(window.ZXingBrowser && ZXingBrowser.BrowserMultiFormatReader)){showStart('The barcode library did not load. Check the internet connection and try again.');return}
       stopCamera();
       try{
-        state.reader=new ZXingBrowser.BrowserMultiFormatReader(undefined,{delayBetweenScanAttempts:80,delayBetweenScanSuccess:450});
+        // Limit decoding to the barcode types used for student IDs and explicitly
+        // enable Code 39 Extended (Full ASCII). These numeric constants match the
+        // pinned ZXing library used by @zxing/browser 0.2.1:
+        // DecodeHintType.POSSIBLE_FORMATS = 2
+        // DecodeHintType.ENABLE_CODE_39_EXTENDED_MODE = 7
+        // BarcodeFormat.CODE_39 = 2; BarcodeFormat.CODE_128 = 4
+        const decodeHints=new Map();
+        decodeHints.set(2,[2,4]);
+        decodeHints.set(7,true);
+        state.reader=new ZXingBrowser.BrowserMultiFormatReader(decodeHints,{delayBetweenScanAttempts:80,delayBetweenScanSuccess:450});
         state.controls=await state.reader.decodeFromConstraints({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}},$('video'),(result,error,controls)=>{
+          state.decodeHeartbeat=Date.now();
           if(result) handleBarcode(typeof result.getText==='function'?result.getText():(result.text||''));
         });
         state.running=true;
@@ -260,7 +294,9 @@
     }
 
     function handleBarcode(raw){
-      if(!state.connected || state.awaiting || state.deleting) return;
+      // A delete can save in the background; only pause barcode handling while the
+      // on-page confirmation sheet itself is visible.
+      if(!state.connected || state.awaiting || state.deleteModalOpen) return;
       const text=String(raw||'').trim();
       const match=text.match(/\d{4,10}/);
       if(!match) return;
@@ -341,25 +377,87 @@
     }
 
     function requestHistoryDelete(entry,button){
-      if(state.deleting || state.awaiting) return;
+      if(state.deleting || state.awaiting || state.deleteModalOpen) return;
       const eid=String(entry&&entry.entryId||'');
       if(!eid){alert('This entry cannot be deleted from the camera history because its attendance entry ID is unavailable.');return}
-      const name=displayName(String(entry.studentName||'this student'));
-      if(!confirm('Delete '+name+' from this event attendance?')) return;
+      state.deleteCandidate={
+        entryId:eid,
+        studentId:String(entry.studentId||''),
+        studentName:String(entry.studentName||'this student')
+      };
+      state.deleteModalOpen=true;
+      $('deleteMessage').textContent='Remove '+displayName(state.deleteCandidate.studentName)+' from this event attendance?';
+      $('deleteModal').classList.remove('hidden');
+    }
+
+    function closeDeleteModal(){
+      state.deleteModalOpen=false;
+      state.deleteCandidate=null;
+      $('deleteModal').classList.add('hidden');
+      ensureDecoderResponsive(state.decodeHeartbeat);
+    }
+
+    function confirmHistoryDelete(){
+      const entry=state.deleteCandidate;
+      if(!entry || state.deleting){closeDeleteModal();return}
+      state.deleteModalOpen=false;
+      state.deleteCandidate=null;
+      $('deleteModal').classList.add('hidden');
       state.deleting=true;
       state.deleteRequestId=randomId();
-      state.deleteEntryId=eid;
-      if(button){button.disabled=true;button.textContent='…'}
-      setConnection('DELETING — waiting for spreadsheet confirmation…','');
-      send({type:'STUDENT_DELETE_REQUEST',requestId:state.deleteRequestId,entryId:eid,studentId:String(entry.studentId||'')});
+      state.deleteEntryId=String(entry.entryId||'');
+      state.heartbeatBeforeDelete=state.decodeHeartbeat;
+
+      // Keep the decoder alive while Google removes the row. Check-ins can continue
+      // while the delete confirmation is on its way back.
+      setConnection('DELETING '+displayName(entry.studentName)+' IN BACKGROUND — scanner remains active','');
+      send({type:'STUDENT_DELETE_REQUEST',requestId:state.deleteRequestId,entryId:state.deleteEntryId,studentId:String(entry.studentId||'')});
       clearTimeout(state.deleteTimer);
       state.deleteTimer=setTimeout(()=>{
         if(!state.deleting) return;
         state.deleting=false;state.deleteRequestId='';state.deleteEntryId='';
-        setConnection('CONNECTED — delete was not confirmed; scanning is still available','good');
+        setConnection('CONNECTED — delete was not confirmed; scanner remains available','good');
         renderHistory();
         errorFeedback();
+        ensureDecoderResponsive(state.heartbeatBeforeDelete);
       },8000);
+
+      // Closing a browser-native confirm dialog was what could suspend ZXing on
+      // iPhone. This on-page sheet does not suspend the page, and this watchdog
+      // automatically restarts the decoder if the browser still pauses it.
+      ensureDecoderResponsive(state.heartbeatBeforeDelete);
+    }
+
+    function cameraStreamIsLive(){
+      try{
+        const v=$('video'), stream=v&&v.srcObject;
+        return !!(stream&&stream.getVideoTracks&&stream.getVideoTracks().some(t=>t.readyState==='live'));
+      }catch(e){return false}
+    }
+
+    function ensureDecoderResponsive(previousHeartbeat){
+      const before=Number(previousHeartbeat||0);
+      const video=$('video');
+      try{if(video&&video.paused&&video.srcObject) video.play().catch(()=>{})}catch(e){}
+      setTimeout(()=>{
+        if(!state.connected || state.deleteModalOpen) return;
+        // ZXing invokes the callback continuously while decoding. If that heartbeat
+        // stopped, or the stream itself died, rebuild the camera automatically.
+        if(!state.running || !cameraStreamIsLive() || Number(state.decodeHeartbeat||0)<=before){
+          restartCameraQuietly();
+        }
+      },700);
+    }
+
+    async function restartCameraQuietly(){
+      if(!state.connected) return;
+      setConnection('RESTARTING CAMERA — one moment…','');
+      try{
+        await startCamera();
+        if(state.connected) setConnection('CONNECTED — camera ready for the next student','good');
+      }catch(e){
+        showStart('The camera paused. Tap Start Camera to resume scanning.');
+      }
     }
 
     function selectHistoryEntry(entry){
